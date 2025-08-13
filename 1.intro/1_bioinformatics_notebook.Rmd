@@ -1,0 +1,111 @@
+---
+title: "Getting Started with R Notebooks — A Gentle Bioinformatics Intro"
+author: "Your Name"
+output: html_notebook
+---
+
+# Welcome
+
+Welcome to your first R Notebook!  
+
+In this session, we will:
+
+1. Learn how R Notebooks mix **code** and **text**.
+2. Create some **fake bioinformatics-style data**.
+3. Explore and inspect a dataframe.
+4. Make a simple scatter plot.
+
+💡 *Tip: Press `Shift + Enter` to run the current cell.*
+  
+---
+
+## 1. Hello World
+
+```{r}
+# This is a code cell
+# Lines starting with '#' are comments and won't run as code
+# Let's print a friendly message
+print("Hello, Bioinformatics world!")
+```
+
+---
+
+## 2. Creating Fake Data
+
+```{r}
+# Let's create some fake data that could look like metabolomics results
+
+# Set a seed for reproducibility
+set.seed(123)
+
+# Create a dataframe with sample IDs, concentration values, and fold change
+bio_data <- data.frame(
+  SampleID = paste0("Sample_", 1:10),
+  Concentration = round(rnorm(10, mean = 50, sd = 5), 2), # Random normal values
+  FoldChange = round(rnorm(10, mean = 1.5, sd = 0.3), 2)  # Random normal values
+)
+
+# View the first rows
+head(bio_data)
+```
+
+---
+
+## 3. Inspecting the Dataframe
+
+```{r}
+# Check the structure of the dataframe
+str(bio_data)
+
+# Get summary statistics
+summary(bio_data)
+
+# See the names of the columns
+colnames(bio_data)
+```
+
+---
+
+## 4. Notes on Data Inspection
+
+- **`str()`**: Shows the structure (column names, types, first few values).
+- **`summary()`**: Gives descriptive statistics.
+- **`colnames()`**: Lists the column names.
+
+---
+
+## 5. Scatter Plot
+
+```{r}
+# Let's make a scatter plot of Concentration vs FoldChange
+
+plot(
+  bio_data$Concentration,
+  bio_data$FoldChange,
+  main = "Concentration vs Fold Change",
+  xlab = "Concentration (arbitrary units)",
+  ylab = "Fold Change",
+  pch = 19, # solid circles
+  col = "blue"
+)
+
+# Optional: Add sample labels
+text(
+  bio_data$Concentration,
+  bio_data$FoldChange,
+  labels = bio_data$SampleID,
+  pos = 4, cex = 0.8
+)
+```
+
+---
+
+## 6. Wrap-Up
+
+✅ How to run code cells and markdown cells  
+✅ How to create a dataframe in R  
+✅ How to inspect and summarize data  
+✅ How to make a simple scatter plot  
+
+Next steps:  
+In the next lesson, we will explore how to use R packages like **BioConductor** to analyze real biological datasets.
