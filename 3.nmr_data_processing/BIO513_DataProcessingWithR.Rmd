@@ -1,0 +1,362 @@
+---
+title: "project - cohort - sampleMatrixType - comment"
+author: "Your Name"
+date: "The Date"
+output: 
+  html_document:
+    css: ../makeConfig.css
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 3
+    number_sections: true
+    theme: lumen
+editor_options: 
+  chunk_output_type: inline
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(knitr)
+library(htmlTable)
+library(dplyr)
+
+library(fusion)
+    ## If you do not have fusion run below
+# remotes::install_url("https://takecare.mylims.org/gitea/jul/rldx/archive/main.tar.gz")
+# remotes::install_github("phenological/nmr-parser@0.1.9")
+# remotes::install_github("jwist/fusion")
+    # @@ Or see https://github.com/phenological/fusion
+
+library(mva.plots)
+    ## If you do not have mva.plot run below
+# remotes::install_github("phenological/mva-plots")
+library(nmr.spectra.processing)
+    ## If you do not have nmr.spectra.processing run below
+# remotes::install_github("phenological/nmr-spectra-processing")
+
+```
+
+# Load spectra daE
+
+## Step 1: set the file.path
+
+```{r}
+# If you have your data stored in the OneDrive ANPC dataset folder then use below by replacing projectName and cohortName to appropriate names
+pathToDaE<-file.path(Sys.getenv("DATASETS"),"projectName","cohortName","DataElements")
+  # Or you can navigate yourself to the folder where you store daE file
+pathToDaE<-"~/Dataset/ProjectName/cohortName/DataElements/"
+
+pathToDaE<-"~/Downloads" # Example
+```
+
+## Step 2: load the daE
+
+```{r}
+### Lets say your Urine NMR spectra daE is called "Urine1DSpectra.daE" then
+da<-local(get(load(file.path(pathToDaE,"studentsProjects_test_URI_STDrXX@local_noesy@prof-urine-noesy.daE"))))
+
+```
+
+## Step 3: extract information from the daE
+
+[da\@varName](mailto:da@varName): column name of the da\@.Data
+(ppm in this daE)
+
+da\@.Data: spectra data
+
+[da\@obsDescr](mailto:da@obsDescr): A list of specta information
+
+-   info: You should find the dataPath, sampleID, sampleType and more
+
+-   proc: (SF: spectra frequency. PHC0: zero-order phase. PHC1: 1st
+    order phase. SR: Spectra Reference)
+
+-   params: all the acqus information
+
+
+```{r}
+
+X<-da@.Data # spectra
+ppm<-as.numeric(da@varName) 
+Anno<-da@obsDescr$info
+info<-da@obsDescr$info
+procs<-da@obsDescr$procs
+params<-da@obsDescr$params
+
+# if you put ppm to the column name of X, also sampleID to the row names would help you with plotting (viewing) later on
+rownames(X)<-Anno$sampleID
+colnames(X)<-ppm
+
+```
+
+### get the metadata
+```{r}
+RunOrder<-read.csv("~/Downloads/NMR_short_course_Paracetamol/NMR_short_course_Paracetamol_RunOrder.csv")
+RunOrder<-RunOrder%>%select(TITLE,EXPNO)%>%
+  mutate(sourceID = sapply(strsplit(TITLE,split = "_"),`[`,2),
+         timepoint = sapply(strsplit(TITLE,split = "_"),`[`,3))
+
+Anno<-cbind(Anno%>%select(sampleID,sampleType),RunOrder[match(Anno$sampleID,RunOrder$EXPNO),3:4])
+rm(da,pathToDaE,RunOrder)
+```
+
+
+
+# Post processing
+
+## Step 1: calibrate spectra to alanine
+
+### check the alanine spectra region (1.45 \~ 1.52 ppm) by plotting the regions using matspec()
+
+<https://github.com/phenological/mva-plots/blob/main/R/matspec.R>
+
+```{r}
+matspec(X,ppm,roi = c(1.45,1.52),interactive = F)
+```
+
+### Calibrate to Alanine doublet using calibrateSpectra()
+
+<https://github.com/phenological/nmr-spectra-processing/blob/main/R/calibrateSpectra.R>
+
+```{r}
+X_cal <- calibrateSpectra(
+  ppm = ppm,
+  Y = X,
+  ref = c("alanine"),
+  maxShift = 1.5,
+  rOref = c(1.45, 1.53),
+  cshift = 1.48
+)
+colnames(X_cal)<-ppm
+
+matspec(X_cal,ppm,roi = c(1.45,1.52),interactive = F)
+
+```
+
+## Step 2: remove selected region of the spectra
+
+```{r}
+
+idx<-c(which(ppm<=0.5),which(ppm>=4.7 & ppm<=5.0),which(ppm>=9.5))
+
+X<-X_cal[,-idx]
+ppm<-ppm[-idx]
+dim(X)[2]==length(ppm)
+rm(idx,X_cal)
+```
+
+## Step 3: Apply baseline correction using baselineCorrection()
+
+<https://github.com/phenological/nmr-spectra-processing/blob/main/R/baselineCorrection.R>
+
+```{r}
+X_bcor<-baselineCorrection(X)
+
+matspec(X,ppm,roi = c(1.45,1.52),interactive = F)
+matspec(X_bcor,ppm,roi = c(1.45,1.52),interactive = F)
+
+```
+
+## Step 4: Apply PQN normalization using normalize()
+
+```{r}
+X_pqn<-normalize(X_bcor)
+matspec(X_bcor,ppm,roi = c(1.45,1.52),interactive = F)
+matspec(,ppm,roi = c(1.45,1.52),interactive = F)
+
+
+```
+
+### plot some spectra
+
+Some region may looked aligned but in Urine, even after alignment to
+alanine, you will find many miss aligned regions
+
+```{r}
+colnames(X_pqn)<-ppm
+matspec(X_pqn,ppm,roi = c(5.2,5.3),interactive = F)
+matspec(X_pqn,ppm,roi = c(7.0,7.5),interactive = F)
+
+```
+
+# Spectra check with PCA
+
+You should see the "ltr" to be cluster tightly.
+
+If not, look at the spectra and find out why (could it be failed water
+suppression?)
+
+You can also check if there are any outliers. Find out which spectra it
+is, plot some spectra to find the reason why.
+
+```{r}
+mod<-PCA(X_pqn,rank = 2)
+
+plotScores(mod,optns = list(color = Anno$sourceID))
+
+PlotLoadSpec(mod,PC= 1,roi = c(0.5,4.5))
+PlotLoadSpec(mod,PC= 1,roi = c(5.0,9.5))
+
+```
+
+# Remove LTRs, Outliers and Original run that has re-runs
+
+If the LTRs are in tight cluster then we can remove them
+
+Outliers: select those that should be excluded (e.g., experimental
+errors)
+
+Original runs of re-runs : when there is a re-runs it must be a reason..
+you can check by plotting them to compare. In general, we want to keep
+the last runs instead of the original runs.
+
+You can find which one is reruns by looking at the sampleID. Those with
+rerun should have "\#" or "." after the sampleID followed by the re-run
+number. (e.g., COV00001#1)
+
+Also noted that apart from Busselton project, all the sampleID should
+have unique 3 capital letters given to each project at the beginning
+followed by 5 digit numbers (total of 8 characters)
+
+# Re-run Post Processing Step 1 to 4 without those LTR etc.,
+
+
+# STOCSY
+https://github.com/phenological/mva-plots/blob/main/R/stocsy.R
+
+### Alanine (example) ### 
+d(1.48) 
+q(3.78) signal intensity may be too low to see this compared to glucose peaks that are also overlap 
+```{r}
+matspec(X_pqn[1:5,],ppm,roi = c(1.46,1.50))
+d = 1.474# Driver peak in ppm
+stocsy(x = ppm,Y = X_pqn,driver = d)
+stocsy(x = ppm,Y = X_pqn,driver = d,roi = c(1.45,1.49))
+
+
+```
+
+### Paracetamol_Sulfate ###
+# 7.36 (d), 7.13 (d), 5.10 (d) as well as a singlet resonance at 2.16 (s).
+```{r}
+matspec(X_pqn,ppm,roi = c(7.1,7.4))
+table(Anno$timepoint)
+tdf<-X_pqn[which(Anno$timepoint=="4hours"),]
+
+matspec(tdf,ppm,roi = c(7.1,7.4))
+
+
+#### 7.36 (d)) ####
+
+tdf1 <- calibrateSpectra(
+  ppm,
+  tdf,
+  ref = c("alanine"),
+  maxShift = 1.5,
+  cshift = 7.36,
+  padding = c("sampling"),
+  rOref = c(7.32, 7.38),
+  shift = TRUE
+)
+
+matspec(tdf1, ppm, roi = c(7.1, 7.4))
+
+tdf[, which(ppm > 7.27 &
+              ppm < 7.385)] <- tdf1[, which(ppm > 7.27 & ppm < 7.385)]
+rm(tdf1)
+
+#### 7.13 (d) ####
+
+matspec(tdf, ppm, roi = c(7.1, 7.4))
+
+tdf1 <- calibrateSpectra(
+  ppm,
+  tdf,
+  ref = c("alanine"),
+  maxShift = 1.5,
+  cshift = 7.13,
+  padding = c("sampling"),
+  rOref = c(7.1, 7.16),
+  shift = TRUE
+)
+
+matspec(tdf1, ppm, roi = c(7.1, 7.4))
+
+tdf[, which(ppm > 7.1 &
+              ppm < 7.165)] <- tdf1[, which(ppm > 7.1 & ppm < 7.165)]
+rm(tdf1)
+
+
+#### 2.16 (s) ####
+
+matspec(tdf, ppm, roi = c(2.15, 2.2))
+
+tdf1 <- calibrateSpectra(
+  ppm,
+  tdf,
+  ref = c("tsp"),
+  maxShift = 1.5,
+  cshift = 2.16,
+  padding = c("sampling"),
+  rOref = c(2.14, 2.17),
+  shift = TRUE
+)
+
+matspec(tdf1, ppm, roi = c(2.15, 2.2))
+
+tdf[, which(ppm > 2.14 &
+              ppm < 2.17)] <- tdf1[, which(ppm > 2.14 & ppm < 2.17)]
+rm(tdf1)
+
+#### 5.10 (d) ####
+matspec(tdf, ppm, roi = c(5.0, 5.15))
+
+tdf1 <- calibrateSpectra(
+  ppm,
+  tdf,
+  ref = c("alanine"),
+  maxShift = 1.5,
+  cshift = 5.1,
+  padding = c("sampling"),
+  rOref = c(5.0, 5.15),
+  shift = TRUE
+)
+
+matspec(tdf1, ppm, roi = c(5.0, 5.15))
+
+tdf[, which(ppm > 5.04 &
+              ppm < 5.14)] <- tdf1[, which(ppm > 5.04 & ppm < 5.14)]
+rm(tdf1)   
+
+### STOCSY at 7.36 (d) ###
+matspec(tdf, ppm, roi = c(7.3, 7.4))
+
+d = 7.3539
+stocsy(x = ppm,Y = X_pqn,driver = d)
+stocsy(x = ppm,Y = X_pqn,driver = d,roi = c(1.45,1.49))
+
+```
+
+
+# Taking Integrals
+```{r}
+Alanine<-apply(X_pqn[,which(ppm>=1.47 & ppm<=1.49)],1,sum)
+
+library(ggplot2)
+data.frame(Anno,Alanine=Alanine)%>%
+  ggplot(aes(x=sourceID,y=Alanine))+geom_boxplot()
+  
+data.frame(Anno,Alanine=Alanine)%>%
+  ggplot(aes(x=sourceID,y=Alanine,color = timepoint))+geom_point()
+
+
+data.frame(Anno,Alanine=Alanine)%>%
+  ggplot(aes(x=timepoint,y=Alanine,group = sourceID,color = sourceID))+geom_point()+geom_line()
+
+```
+
+
+
