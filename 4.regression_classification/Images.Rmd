@@ -1,0 +1,149 @@
+---
+title: "Regression"
+output: html_document
+---
+RMSE and R2
+
+```{r}
+set.seed(123)
+
+# --- Synthetic data for illustration ---
+n <- 50
+x <- seq(20, 35, length.out = n)
+
+# High R² / Low RMSE
+y_true1 <- 0.8 * x + 5
+y_pred1 <- y_true1 + rnorm(n, sd = 1)  # small noise
+
+# Low R² / High RMSE
+y_true2 <- 0.8 * x + 5
+y_pred2 <- y_true2 + rnorm(n, sd = 8)  # large noise
+
+# Function to compute R² and RMSE
+metrics <- function(y, yhat) {
+  r2 <- 1 - sum((y - yhat)^2) / sum((y - mean(y))^2)
+  rmse <- sqrt(mean((y - yhat)^2))
+  list(R2 = r2, RMSE = rmse)
+}
+
+m1 <- metrics(y_true1, y_pred1)
+m2 <- metrics(y_true2, y_pred2)
+
+# --- Plot side-by-side ---
+par(mfrow = c(1,2), mar = c(5,5,4,2))
+
+
+# Good fit
+plot(y_true1, y_pred1, pch = 19, col = "steelblue",
+     xlab = "Actual", ylab = "Predicted",
+     main = sprintf("High R², Low RMSE\nR² = %.2f, RMSE = %.2f", m1$R2, m1$RMSE))
+abline(0,1,lty=2,col="red")
+
+# Poor fit
+plot(y_true2, y_pred2, pch = 19, col = "tomato",
+     xlab = "Actual", ylab = "Predicted",
+     main = sprintf("Low R², High RMSE\nR² = %.2f, RMSE = %.2f", m2$R2, m2$RMSE))
+abline(0,1,lty=2,col="red")
+#png("my_plot.png", width = 800, height = 600, units = "px")
+```
+
+Overfitting
+
+```{r overfitting, echo=TRUE, message=FALSE, warning=FALSE, fig.width=12, fig.height=5}
+
+set.seed(123)
+
+# --- Simulate 8 points with positive correlation ---
+x <- 1:8
+y <- 2*x + rnorm(8, sd = 2)   # line with some noise
+
+# --- Linear model (sensible) ---
+fit_lin <- lm(y ~ x)
+
+# --- 7th-degree polynomial (dangerous overfit with 8 points) ---
+fit_poly <- lm(y ~ poly(x, 7, raw = TRUE))
+
+# --- Predictions for smooth curve ---
+xx <- seq(min(x), max(x), length.out = 400)
+yy_lin  <- predict(fit_lin,  newdata = data.frame(x = xx))
+yy_poly <- predict(fit_poly, newdata = data.frame(x = xx))
+
+# --- Wider plot: adjust device size ---
+# In RMarkdown/knitr you can set fig.width = 12, fig.height = 5
+# Or just use quartz(width=12,height=5) / windows() / x11() in base R
+par(mfrow = c(1,2), mar = c(5,5,4,2))
+
+# Linear fit
+plot(x, y, pch = 19, col = "black", main = "Linear fit",
+     xlab = "x", ylab = "y", cex.main=1.5, ylim = range(c(y, yy_poly)))
+lines(xx, yy_lin, col = "blue", lwd = 2)
+legend("topleft", legend = c("Data", "Linear fit"),
+       pch = c(19, NA), lty = c(NA,1),
+       col = c("black", "blue"), bty = "n")
+
+# Polynomial fit
+plot(x, y, pch = 19, col = "black", main = "7th-degree Polynomial",
+     xlab = "x", ylab = "y", cex.main=1.5, ylim = range(c(y, yy_poly)))
+lines(xx, yy_poly, col = "red", lwd = 2)
+legend("topleft", legend = c("Data", "Poly fit"),
+       pch = c(19, NA), lty = c(NA,1),
+       col = c("black", "red"), bty = "n")
+
+```
+RMSE from training vs test
+```{r}
+set.seed(123)
+
+# Simulate "idealized" RMSE curves for training and test
+pcs <- 1:20
+
+# Training RMSE: always decreases with more PCs
+train_rmse <- 3 - 0.08*pcs + rnorm(length(pcs), sd = 0.05)
+train_rmse[train_rmse < 0.5] <- 0.5  # floor
+
+# Test RMSE: U-shaped (bias high with few PCs, variance high with too many)
+test_rmse <- 1 + 0.3*(pcs-8)^2/64 + rnorm(length(pcs), sd = 0.05)
+
+# --- Plot ---
+plot(pcs, train_rmse, type = "o", pch = 19, col = "blue",
+     ylim = range(c(train_rmse, test_rmse)),
+     xlab = "Number of PCs", ylab = "RMSE",
+     main = "Train vs Test RMSE as a Function of #PCs")
+lines(pcs, test_rmse, type = "o", pch = 19, col = "red")
+legend("topright", legend = c("Train RMSE", "Test RMSE"),
+       col = c("blue", "red"), pch = 19, lty = 1, bty = "n")
+
+# Highlight the 'sweet spot' (minimum test RMSE)
+best_k <- pcs[which.min(test_rmse)]
+points(best_k, min(test_rmse), pch = 21, bg = "yellow", cex = 1.5)
+text(best_k, min(test_rmse)+0.15, labels = paste("Best =", best_k, "PCs"), pos = 3)
+
+```
+
+```{r}
+set.seed(23)
+
+# Simulate 100 "No COVID" points, 10 "COVID" points, not perfectly separable
+n_no <- 100
+n_yes <- 10
+
+# Fake features: 2D Gaussian blobs with overlap
+x_no <- cbind(rnorm(n_no, mean = 0), rnorm(n_no, mean = 0))
+x_yes <- cbind(rnorm(n_yes, mean = 1), rnorm(n_yes, mean = 1))
+
+# Combine
+X <- rbind(x_no, x_yes)
+y <- factor(c(rep("No COVID", n_no), rep("COVID", n_yes)))
+
+# Plot
+cols <- c("COVID" = "tomato", "No COVID" = "steelblue")
+plot(X, col = cols[as.character(y)], pch = 19,
+     xlab = "PC1", ylab = "PC2",
+     main = "Unbalanced data: 100 No COVID vs 10 COVID")
+legend("topright", legend = levels(y), col = cols, pch = 19, bty = "n")
+
+# Add a "trivial classifier" line (everything predicted as No COVID)
+abline(v = 3, lty = 2, col = "darkgray")  # arbitrary line, never classifies as COVID
+
+```
+

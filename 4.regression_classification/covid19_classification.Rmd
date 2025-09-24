@@ -1,0 +1,451 @@
+
+title: "Metabolomics Workshop: Regression & Classification with 1H NMR (RStudio)"
+author: "A. Castillo"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Reproducibility
+set.seed(123)
+
+# Lightweight packages only (no tidyverse)
+pkgs <- c(
+  "caret",     # splitting, preprocessing
+  "rpart",     # decision tree
+  "rpart.plot",# tree plotting
+  "class",     # kNN
+  "pROC",      # (optional) ROC/AUC
+  "ROCR"       # (optional) ROC curves
+)
+new <- pkgs[!(pkgs %in% installed.packages()[, "Package"])]
+if (length(new)) install.packages(new, dependencies = TRUE)
+for (p in pkgs) library(p, character.only = TRUE)
+```
+
+# 1. Dataset & Goal
+
+**Goal**
+
+- **Regression:** Use plasma 1H NMR spectra to predict numeric **BMI**.
+- **Classification:** Use spectra to predict **COVID** (Positive) vs **No COVID**.
+
+**Dataset**: `covid_19_noesy.tsv` (TSV).
+- First columns (metadata): `id, category, Class, sex, age, BMI`.
+- Remaining columns: spectral intensities (~8K points).
+- Combine `Follow_up` + `Healthy_control` → **No COVID**; `Patient (+) SARS-CoV-2` → **COVID**.
+
+We will:
+1) Train/Test split (stratified).
+2) PCA on spectra for dimensionality reduction.
+3) Build/evaluate models (R²/MSE for regression; Confusion Matrix/Accuracy/F1 for classification).
+4) (Optional) Try simple up/down-sampling on the **training set**.
+
+---
+
+# 2. Load & Prepare Data (Base R)
+
+```{r load}
+raw <- read.table(file="../2.univariate/covid_19_noesy.tsv", sep='\t', header=TRUE)
+
+
+# Harmonize label: No COVID vs COVID
+# Expect categories: "Follow_up", "Healthy_control", "Patient (+) SARS-CoV-2"
+raw$covid_bin <- ifelse(raw$category %in% c("Follow_up", "Healthy_control"),
+                        "No COVID",
+                 ifelse(raw$category %in% c("Patient (+) SARS-CoV-2"),
+                        "COVID", NA))
+raw$covid_bin <- factor(raw$covid_bin, levels = c("No COVID", "COVID"))
+
+cat("\nOriginal category counts:\n")
+print(table(raw$category, useNA = "ifany"))
+cat("\nBinary class counts (covid_bin):\n")
+print(table(raw$covid_bin, useNA = "ifany"))
+```
+
+```{r select-spectra}
+# Identify metadata columns present
+meta_cols <- c("id", "category", "Class", "sex", "age", "BMI", "covid_bin")
+meta_cols_present <- intersect(meta_cols, colnames(raw))
+
+# Spectra columns = numeric columns not in metadata
+num_idx  <- which(sapply(raw, is.numeric))
+meta_idx <- match(meta_cols_present, colnames(raw))
+meta_idx <- meta_idx[!is.na(meta_idx)]
+spectra_idx <- setdiff(num_idx, meta_idx)
+
+stopifnot(length(spectra_idx) > 50)  # expect many spectral points
+
+spectra_mat <- as.matrix(raw[, spectra_idx, drop = FALSE])
+
+# Keep a working frame with targets
+Dat <- raw[, meta_cols_present, drop = FALSE]
+
+# Quick summaries
+if ("BMI" %in% colnames(Dat)) summary(Dat$BMI)
+```
+
+> **Note**: We intentionally use **only NMR spectra** (after PCA) as predictors for both tasks to keep the exercise focused on spectral learning. You can later add age/sex as extra predictors to compare.
+
+---
+
+# 3. Train/Test Split (Stratified on Class)
+
+```{r split}
+set.seed(123)
+if (!("covid_bin" %in% colnames(Dat))) stop("covid_bin column missing after relabel.")
+
+idx_cls <- createDataPartition(Dat$covid_bin, p = 0.7, list = FALSE)
+
+train_spectra <- spectra_mat[idx_cls, , drop = FALSE]
+train_meta    <- Dat[idx_cls, , drop = FALSE]
+
+test_spectra  <- spectra_mat[-idx_cls, , drop = FALSE]
+test_meta     <- Dat[-idx_cls, , drop = FALSE]
+
+if ("BMI" %in% colnames(train_meta)) { summary(train_meta$BMI); summary(test_meta$BMI) }
+```
+
+---
+
+3.5 Remove some regions from spectra
+
+```{r roi}
+# Convert spectral column names to numeric ppm values robustly
+ppm_from_colnames <- function(nms) {
+# Try direct numeric first (works if check.names = FALSE and names are like "-0.12", "4.70")
+v <- suppressWarnings(as.numeric(nms))
+if (sum(!is.na(v)) == length(nms)) return(v)
+# Handle names like "X.0.095" (negative) and "X0.095" (positive)
+out <- rep(NA_real_, length(nms))
+is_neg <- grepl("^X\\.", nms)
+is_pos <- grepl("^X(?!\\.)", nms, perl = TRUE)
+out[is_neg] <- -suppressWarnings(as.numeric(sub("^X\\.", "", nms[is_neg])))
+out[is_pos] <- suppressWarnings(as.numeric(sub("^X", "", nms[is_pos])))
+# Fallback: try as.numeric raw
+need <- is.na(out)
+if (any(need)) out[need] <- suppressWarnings(as.numeric(nms[need]))
+out
+}
+
+
+ppm <- ppm_from_colnames(colnames(spectra_mat))
+# Sanity check: range of ppm
+cat(sprintf("ppm range: [%.3f, %.3f]\n", min(ppm, na.rm = TRUE), max(ppm, na.rm = TRUE)))
+
+
+# === Define ROI selection ===
+# You can EITHER EXCLUDE ranges (e.g., water 4.5–5.1 ppm), or INCLUDE only a window.
+# Use one mode at a time.
+mode <- "exclude" # choices: "exclude" or "include"
+
+
+# Example exclude ranges (modify as needed). Each element is c(min_ppm, max_ppm)
+exclude_ranges <- list(c(-1, 2.8), c(4.5, 5.2)) # list(c(-1, 1.5), c(2, 3), c(4.5, 5.1), c(5.5, 6.5), c(8, 10)) # water region; add more ranges if needed
+exclude_ranges <- list(c(4.5, 5.1)) # list(c(-1, 1.5), c(2, 3), c(4.5, 5.1), c(5.5, 6.5), c(8, 10)) # water region; add more ranges if needed
+
+
+# Example include range (use only if mode == "include")
+include_range <- c(-0.2, 0.2) # narrow ROI example around 0 ppm (modify as needed)
+
+
+keep_idx <- rep(TRUE, length(ppm))
+if (mode == "exclude" && length(exclude_ranges) > 0) {
+for (rg in exclude_ranges) {
+if (length(rg) == 2 && !any(is.na(rg))) {
+lo <- min(rg); hi <- max(rg)
+keep_idx <- keep_idx & !(ppm >= lo & ppm <= hi)
+}
+}
+} else if (mode == "include" && length(include_range) == 2) {
+lo <- min(include_range); hi <- max(include_range)
+keep_idx <- (ppm >= lo & ppm <= hi)
+}
+
+
+# Apply mask and sort by decreasing ppm (conventional NMR axis)
+ppm_kept <- ppm[keep_idx]
+cols_kept <- which(keep_idx)
+ord <- order(ppm_kept, decreasing = TRUE)
+
+
+spectra_mat_roi <- spectra_mat[, cols_kept, drop = FALSE]
+spectra_mat_roi <- spectra_mat_roi[, ord, drop = FALSE]
+ppm_kept <- ppm_kept[ord]
+
+
+# Quick overlay plot of all spectra in ROI
+# (If many spectra, use transparency)
+col_line <- grDevices::adjustcolor("black", alpha.f = 0.3)
+matplot(ppm_kept, t(spectra_mat_roi), type = "l", lty = 1, col = col_line,
+xlab = "ppm", ylab = "Intensity", main = "All spectra (ROI filtered)")
+
+
+# Optional: visualize excluded ranges
+if (mode == "exclude" && length(exclude_ranges) > 0) {
+for (rg in exclude_ranges) {
+lo <- min(rg); hi <- max(rg)
+abline(v = c(lo, hi), col = "red", lty = 3)
+}
+}
+
+
+# From here on, use the ROI-filtered spectra
+spectra_mat <- spectra_mat_roi
+```
+
+---
+
+# 4. PCA on Training Spectra, Apply to Test
+
+```{r pca}
+# PCA with centering & scaling
+pca_fit <- prcomp(train_spectra, center = TRUE, scale. = TRUE)
+
+# Variance explained to help choose PCs
+var_explained <- pca_fit$sdev^2 / sum(pca_fit$sdev^2)
+cumvar <- cumsum(var_explained)
+head(data.frame(PC = seq_along(var_explained), Var = var_explained, CumVar = cumvar), 15)
+
+# Choose number of PCs (e.g., 5). Adjust as needed (3–10)
+nPC <- 5
+
+# Project to PC space
+train_PC <- pca_fit$x[, 1:nPC, drop = FALSE]
+test_PC  <- predict(pca_fit, newdata = test_spectra)[, 1:nPC, drop = FALSE]
+
+# For convenience, make data frames with targets
+train_reg <- data.frame(BMI = train_meta$BMI, train_PC)
+test_reg  <- data.frame(BMI = test_meta$BMI,  test_PC)
+
+train_cls <- data.frame(covid_bin = train_meta$covid_bin, train_PC)
+test_cls  <- data.frame(covid_bin = test_meta$covid_bin,  test_PC)
+```
+
+*Tip:* If the first ~5–10 PCs already capture a large fraction of variance (and show bio-separation), that’s usually enough for simple models.
+
+
+# 6. CLASSIFICATION — COVID vs No COVID
+
+We compare **Logistic Regression**, **Decision Tree**, and **k-NN** using the same PC features.
+
+## 6.1 Logistic Regression
+```{r logit}
+# Logistic Regression (GLM with binomial)
+logit_formula <- as.formula(paste("covid_bin ~", paste(colnames(train_PC), collapse = "+")))
+logit_glm <- glm(logit_formula, data = data.frame(covid_bin = train_cls$covid_bin, train_PC), family = binomial)
+summary(logit_glm)
+
+# Predict probabilities on test
+prob_logit <- predict(logit_glm, newdata = data.frame(covid_bin = test_cls$covid_bin, test_PC), type = "response")
+pred_logit <- ifelse(prob_logit >= 0.5, "COVID", "No COVID")
+pred_logit <- factor(pred_logit, levels = levels(test_cls$covid_bin))
+```
+
+## 6.1.2 Visualization of classification vs PCA
+
+```{r logit-visuals, fig.width=7, fig.height=5}
+## --- Helper plotting function ---
+plot_pc_scatter <- function(PC, classes, title, main_suffix="") {
+  # PC: matrix/data.frame with at least 2 columns (PC1, PC2)
+  # classes: factor with class labels
+  cols <- c("No COVID" = "steelblue", "COVID" = "tomato")
+  
+  plot(PC[,1], PC[,2], col = cols[as.character(classes)], pch = 19,
+       xlab = "PC1", ylab = "PC2",
+       main = paste(title, main_suffix))
+  legend("topright", legend = levels(classes),
+         col = cols, pch = 19, bty = "n")
+}
+
+## --- Training set: real vs predicted ---
+# Real
+plot_pc_scatter(train_PC, train_cls$covid_bin, "Training set", "— Real class")
+# Predicted
+prob_train <- predict(logit_glm, newdata = data.frame(train_PC), type = "response")
+pred_train <- ifelse(prob_train >= 0.5, "COVID", "No COVID")
+pred_train <- factor(pred_train, levels = levels(train_cls$covid_bin))
+plot_pc_scatter(train_PC, pred_train, "Training set", "— Predicted class")
+
+## --- Test set: real vs predicted ---
+# Real
+plot_pc_scatter(test_PC, test_cls$covid_bin, "Test set", "— Real class")
+# Predicted (you already have pred_logit)
+plot_pc_scatter(test_PC, pred_logit, "Test set", "— Predicted class")
+
+```
+
+## 6.2 Decision Tree
+```{r tree}
+set.seed(123)
+# Use same predictor set (PCs) with rpart (classification)
+tree_fit <- rpart(logit_formula, data = data.frame(covid_bin = train_cls$covid_bin, train_PC), method = "class",
+                  control = rpart.control(cp = 0.01))
+rpart.plot(tree_fit)
+
+prob_tree <- predict(tree_fit, newdata = data.frame(covid_bin = test_cls$covid_bin, test_PC), type = "prob")[, "COVID"]
+pred_tree <- ifelse(prob_tree >= 0.5, "COVID", "No COVID")
+pred_tree <- factor(pred_tree, levels = levels(test_cls$covid_bin))
+```
+## Decision Tree with more splits
+```{r}
+set.seed(123)
+tree_fit <- rpart(
+  logit_formula,
+  data = data.frame(covid_bin = train_cls$covid_bin, train_PC),
+  method = "class",
+  control = rpart.control(
+    cp = 0.0001,      # very small cp → more splits
+    minsplit = 5,     # allow splits with few samples
+    minbucket = 2,    # allow small terminal nodes
+    maxdepth = 5      # force deeper tree (adjust as you like)
+  )
+)
+
+rpart.plot(tree_fit, type = 2, extra = 104, under = TRUE, faclen = 0)
+```
+
+## 6.3 k-Nearest Neighbors (kNN)
+```{r knn}
+# Prepare matrices for kNN
+train_mat <- as.matrix(train_PC)
+test_mat  <- as.matrix(test_PC)
+
+# Standardize PCs (should already be scaled, but re-scale to be safe)
+pre <- preProcess(train_mat, method = c("center", "scale"))
+train_s <- predict(pre, train_mat)
+test_s  <- predict(pre, test_mat)
+
+k <- 5
+pred_knn <- knn(train = train_s, test = test_s,
+               cl = train_cls$covid_bin, k = k)
+pred_knn <- factor(pred_knn, levels = levels(test_cls$covid_bin))
+```
+
+## 6.4 Evaluation: Confusion Matrix, Accuracy, Precision, Recall, F1
+```{r metrics}
+# Helper to compute metrics from predictions
+compute_metrics <- function(truth, pred) {
+  # Ensure both factors share the same levels
+  lv <- levels(truth)
+  truth_f <- factor(truth, levels = lv)
+  pred_f  <- factor(pred,  levels = lv)
+  cm <- table(Truth = truth_f, Pred = pred_f)
+  acc <- sum(diag(cm)) / sum(cm)
+  # Positive class = "COVID"
+  tp <- cm["COVID", "COVID"]
+  fp <- cm["No COVID", "COVID"]
+  fn <- cm["COVID", "No COVID"]
+  precision <- ifelse(tp + fp == 0, NA, tp / (tp + fp))
+  recall    <- ifelse(tp + fn == 0, NA, tp / (tp + fn))
+  f1 <- ifelse(is.na(precision) | is.na(recall) | (precision + recall == 0), NA,
+               2 * precision * recall / (precision + recall))
+  list(cm = cm, acc = acc, precision = precision, recall = recall, f1 = f1)
+}
+
+m_logit <- compute_metrics(test_cls$covid_bin, pred_logit)
+m_tree  <- compute_metrics(test_cls$covid_bin, pred_tree)
+m_knn   <- compute_metrics(test_cls$covid_bin, pred_knn)
+
+# Show results
+show_metrics <- function(name, m) {
+  cat("\n===", name, "===\n")
+  print(m$cm)
+  cat(sprintf("Accuracy: %.3f\n", m$acc))
+  cat(sprintf("Precision (COVID): %.3f\n", m$precision))
+  cat(sprintf("Recall (COVID): %.3f\n", m$recall))
+  cat(sprintf("F1 (COVID): %.3f\n", m$f1))
+}
+
+show_metrics("Logistic Regression", m_logit)
+show_metrics("Decision Tree", m_tree)
+show_metrics("kNN (k=5)", m_knn)
+
+# Compact comparison table (base R)
+comp <- data.frame(
+  Model = c("Logistic", "Tree", "kNN (k=5)"),
+  Accuracy = c(m_logit$acc, m_tree$acc, m_knn$acc),
+  F1_COVID = c(m_logit$f1, m_tree$f1, m_knn$f1)
+)
+comp <- comp[order(-comp$F1_COVID), ]
+print(comp, row.names = FALSE)
+```
+
+> **Why F1?** When classes are **imbalanced**, Accuracy can be misleading. **F1** balances Precision and Recall for the positive class (here, **COVID**).
+
+---
+
+# 7. (Optional) Addressing Class Imbalance via Resampling
+
+We demonstrate **oversampling** on the **training set only** using ROSE. Re-train Logistic Regression on the resampled training data.
+
+```{r resample, eval=FALSE}
+# Only run if you want to try oversampling
+if (!require(ROSE)) install.packages("ROSE"); library(ROSE)
+
+train_aug <- data.frame(covid_bin = train_cls$covid_bin, train_PC)
+
+# ROSE synthetic oversampling towards balanced classes
+set.seed(123)
+rose_out <- ROSE(covid_bin ~ ., data = train_aug, seed = 123)$data
+
+print(table(train_cls$covid_bin))
+print(table(rose_out$covid_bin))
+
+# Refit logistic on oversampled data
+logit_glm_ros <- glm(covid_bin ~ ., data = rose_out, family = binomial)
+prob_logit_ros <- predict(logit_glm_ros, newdata = data.frame(covid_bin = test_cls$covid_bin, test_PC), type = "response")
+pred_logit_ros <- ifelse(prob_logit_ros >= 0.5, "COVID", "No COVID")
+pred_logit_ros <- factor(pred_logit_ros, levels = levels(test_cls$covid_bin))
+
+m_logit_ros <- compute_metrics(test_cls$covid_bin, pred_logit_ros)
+show_metrics("Logistic (ROSE Oversampled Train)", m_logit_ros)
+```
+
+> **Guideline:** Always apply resampling **only on the training set**, never on the test set.
+
+---
+
+# 8. Quick Visuals for Interpretation (Base Graphics)
+
+```{r visuals, fig.width=7, fig.height=5}
+# PCA scores plot (first two PCs) colored by class
+cols <- as.integer(train_cls$covid_bin)
+plot(train_PC[,1], train_PC[,2], col = cols,
+     xlab = "PC1", ylab = "PC2", main = "Training PCA Scores by Class")
+legend("topright", legend = levels(train_cls$covid_bin),
+       col = 1:length(levels(train_cls$covid_bin)), pch = 1)
+
+# Logistic coefficients (by PC)
+co <- coef(summary(logit_glm))
+# Drop intercept if present
+if ("(Intercept)" %in% rownames(co)) co <- co[setdiff(rownames(co), "(Intercept)"), , drop = FALSE]
+barplot(co[, "Estimate"], names.arg = rownames(co), las = 2,
+        main = "Logistic Regression Coefficients (PCs)", ylab = "Estimate")
+```
+
+---
+
+# 9. What to Try Next (Exercises)
+
+1. Vary `nPC` between 3–10. How do R²/MSE (regression) and F1 (classification) change?
+2. Add clinical covariates (e.g., **age**, **sex**) to the PC predictors. Does performance improve? Any overfitting?
+3. Tune decision tree complexity (`cp`) and kNN `k` (try 3, 7, 9...).
+4. Try **undersampling** the majority class (e.g., with ROSE `ovun.sample(method = "under")`).
+5. Create ROC curves and compute AUC (packages `pROC` or `ROCR`).
+
+---
+
+# 10. Appendix: Session Info
+
+```{r session}
+sessionInfo()
+```
+

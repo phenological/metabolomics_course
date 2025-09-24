@@ -1,0 +1,496 @@
+
+title: "Metabolomics Workshop: Regression & Classification with 1H NMR (RStudio)"
+author: "A. Castillo"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+  pdf_document: default
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+# Reproducibility
+set.seed(123)
+
+# Lightweight packages only (no tidyverse)
+pkgs <- c(
+  "caret",     # splitting, preprocessing
+  "rpart",     # decision tree
+  "rpart.plot",# tree plotting
+  "class",     # kNN
+  "pROC",      # (optional) ROC/AUC
+  "ROCR"       # (optional) ROC curves
+)
+new <- pkgs[!(pkgs %in% installed.packages()[, "Package"])]
+if (length(new)) install.packages(new, dependencies = TRUE)
+for (p in pkgs) library(p, character.only = TRUE)
+```
+
+# 1. Dataset & Goal
+
+**Goal**
+
+- **Regression:** Use plasma 1H NMR spectra to predict numeric **BMI**.
+- **Classification:** Use spectra to predict **COVID** (Positive) vs **No COVID**.
+
+**Dataset**: `covid_19_noesy.tsv` (TSV).
+- First columns (metadata): `id, category, Class, sex, age, BMI`.
+- Remaining columns: spectral intensities (~8K points).
+- Combine `Follow_up` + `Healthy_control` → **No COVID**; `Patient (+) SARS-CoV-2` → **COVID**.
+
+We will:
+1) Train/Test split (stratified).
+2) PCA on spectra for dimensionality reduction.
+3) Build/evaluate models (R²/MSE for regression; Confusion Matrix/Accuracy/F1 for classification).
+4) (Optional) Try simple up/down-sampling on the **training set**.
+
+---
+
+# 2. Load & Prepare Data (Base R)
+
+```{r load}
+#raw <- read.table(file="../2.univariate/covid_19_cpmg.tsv", sep='\t', header=TRUE)
+raw <- read.table(file="../2.univariate/covid_19_noesy.tsv", sep='\t', header=TRUE)
+
+
+# Harmonize label: No COVID vs COVID
+# Expect categories: "Follow_up", "Healthy_control", "Patient (+) SARS-CoV-2"
+raw$covid_bin <- ifelse(raw$category %in% c("Follow_up", "Healthy_control"),
+                        "No COVID",
+                 ifelse(raw$category %in% c("Patient (+) SARS-CoV-2"),
+                        "COVID", NA))
+raw$covid_bin <- factor(raw$covid_bin, levels = c("No COVID", "COVID"))
+
+cat("\nOriginal category counts:\n")
+print(table(raw$category, useNA = "ifany"))
+cat("\nBinary class counts (covid_bin):\n")
+print(table(raw$covid_bin, useNA = "ifany"))
+```
+
+```{r}
+# Create a barchar with the counts of each category
+barplot(table(raw$category), col = c("lightblue", "salmon"),
+        main = "Counts by category", ylab = "Count", xlab = "Category")  
+  
+```
+
+
+```{r select-spectra}
+# Identify metadata columns present
+meta_cols <- c("id", "category", "Class", "sex", "age", "BMI", "covid_bin")
+meta_cols_present <- intersect(meta_cols, colnames(raw))
+
+# Remove rows where BMI <= 0
+raw <- raw[raw$BMI > 0,]
+
+# Spectra columns = numeric columns not in metadata
+num_idx  <- which(sapply(raw, is.numeric))
+meta_idx <- match(meta_cols_present, colnames(raw))
+meta_idx <- meta_idx[!is.na(meta_idx)]
+spectra_idx <- setdiff(num_idx, meta_idx)
+
+stopifnot(length(spectra_idx) > 50)  # expect many spectral points
+
+# Remove rows where BMI <= 0
+spectra_mat <- as.matrix(raw[, spectra_idx, drop = FALSE])
+
+# Keep a working frame with targets
+Dat <- raw[, meta_cols_present, drop = FALSE]
+
+# Quick summaries
+if ("BMI" %in% colnames(Dat)) summary(Dat$BMI)
+```
+
+> **Note**: We intentionally use **only NMR spectra** (after PCA) as predictors for both tasks to keep the exercise focused on spectral learning. You can later add age/sex as extra predictors to compare.
+
+---
+
+# 3. Train/Test Split (Stratified on Class)
+
+```{r split}
+set.seed(123)
+if (!("covid_bin" %in% colnames(Dat))) stop("covid_bin column missing after relabel.")
+
+idx_cls <- createDataPartition(Dat$covid_bin, p = 0.7, list = FALSE)
+
+train_spectra <- spectra_mat[idx_cls, , drop = FALSE]
+train_meta    <- Dat[idx_cls, , drop = FALSE]
+
+test_spectra  <- spectra_mat[-idx_cls, , drop = FALSE]
+test_meta     <- Dat[-idx_cls, , drop = FALSE]
+
+if ("BMI" %in% colnames(train_meta)) { summary(train_meta$BMI); summary(test_meta$BMI) }
+```
+
+---
+
+# 4. PCA on Training Spectra, Apply to Test
+
+```{r pca}
+# PCA with centering & scaling
+pca_fit <- prcomp(train_spectra, center = TRUE, scale. = TRUE)
+
+# Variance explained to help choose PCs
+var_explained <- pca_fit$sdev^2 / sum(pca_fit$sdev^2)
+cumvar <- cumsum(var_explained)
+head(data.frame(PC = seq_along(var_explained), Var = var_explained, CumVar = cumvar), 15)
+
+# Choose number of PCs (e.g., 5). Adjust as needed (3–10)
+nPC <- 5
+
+# Project to PC space
+train_PC <- pca_fit$x[, 1:nPC, drop = FALSE]
+test_PC  <- predict(pca_fit, newdata = test_spectra)[, 1:nPC, drop = FALSE]
+
+# For convenience, make data frames with targets
+train_reg <- data.frame(BMI = train_meta$BMI, train_PC)
+test_reg  <- data.frame(BMI = test_meta$BMI,  test_PC)
+
+train_cls <- data.frame(covid_bin = train_meta$covid_bin, train_PC)
+test_cls  <- data.frame(covid_bin = test_meta$covid_bin,  test_PC)
+```
+
+*Tip:* If the first ~5–10 PCs already capture a large fraction of variance (and show bio-separation), that’s usually enough for simple models.
+
+---
+
+# 5. REGRESSION — Predict BMI from PCs
+
+```{r regression-fit}
+# Multiple Linear Regression (BMI ~ PCs)
+reg_formula <- as.formula(paste("BMI ~", paste(colnames(train_PC), collapse = "+")))
+reg_lm <- lm(reg_formula, data = train_reg)
+summary(reg_lm)
+```
+
+```{r regression-eval 0}
+# Predict on test
+pred_bmi <- predict(reg_lm, newdata = train_reg)
+
+gt <- train_reg$BMI
+mse <- mean((gt - pred_bmi)^2)
+ss_res <- sum((gt - pred_bmi)^2)
+ss_tot <- sum((gt - mean(gt, na.rm = TRUE))^2)
+r2 <- 1 - ss_res/ss_tot
+
+cat(sprintf("Train MSE: %.3f\n", mse))
+cat(sprintf("Train R^2: %.3f\n", r2))
+
+# Plot predicted vs. actual
+plot(gt, pred_bmi,
+     xlab = "Actual BMI", ylab = "Predicted BMI",
+     main = sprintf("BMI Regression: Train Set (nPC=%d)\nR^2=%.3f, MSE=%.3f", nPC, r2, mse))
+abline(0, 1, lty = 2)
+
+```
+
+
+```{r regression-eval}
+# Predict on test
+pred_bmi <- predict(reg_lm, newdata = test_reg)
+
+gt <- test_reg$BMI
+mse <- mean((gt - pred_bmi)^2)
+ss_res <- sum((gt - pred_bmi)^2)
+ss_tot <- sum((gt - mean(gt, na.rm = TRUE))^2)
+r2 <- 1 - ss_res/ss_tot
+
+cat(sprintf("Test MSE: %.3f\n", mse))
+cat(sprintf("Test R^2: %.3f\n", r2))
+
+# Plot predicted vs. actual
+plot(gt, pred_bmi,
+     xlab = "Actual BMI", ylab = "Predicted BMI",
+     main = sprintf("BMI Regression: Test Set (nPC=%d)\nR^2=%.3f, MSE=%.3f", nPC, r2, mse))
+abline(0, 1, lty = 2)
+```
+
+> **Interpretation:** Higher R² and lower MSE indicate better predictive performance. Check `summary(reg_lm)` to see which PCs contribute most.
+
+---
+
+That clearly does not work. So, let's clean the data first
+
+
+```{r roi}
+# Convert spectral column names to numeric ppm values robustly
+ppm_from_colnames <- function(nms) {
+# Try direct numeric first (works if check.names = FALSE and names are like "-0.12", "4.70")
+v <- suppressWarnings(as.numeric(nms))
+if (sum(!is.na(v)) == length(nms)) return(v)
+# Handle names like "X.0.095" (negative) and "X0.095" (positive)
+out <- rep(NA_real_, length(nms))
+is_neg <- grepl("^X\\.", nms)
+is_pos <- grepl("^X(?!\\.)", nms, perl = TRUE)
+out[is_neg] <- -suppressWarnings(as.numeric(sub("^X\\.", "", nms[is_neg])))
+out[is_pos] <- suppressWarnings(as.numeric(sub("^X", "", nms[is_pos])))
+# Fallback: try as.numeric raw
+need <- is.na(out)
+if (any(need)) out[need] <- suppressWarnings(as.numeric(nms[need]))
+out
+}
+
+
+ppm <- ppm_from_colnames(colnames(spectra_mat))
+# Sanity check: range of ppm
+cat(sprintf("ppm range: [%.3f, %.3f]\n", min(ppm, na.rm = TRUE), max(ppm, na.rm = TRUE)))
+
+
+# === Define ROI selection ===
+# You can EITHER EXCLUDE ranges (e.g., water 4.5–5.1 ppm), or INCLUDE only a window.
+# Use one mode at a time.
+mode <- "exclude" # choices: "exclude" or "include"
+
+
+# Example exclude ranges (modify as needed). Each element is c(min_ppm, max_ppm)
+exclude_ranges <- list(c(-1, 2.8), c(4.5, 5.2)) # list(c(-1, 1.5), c(2, 3), c(4.5, 5.1), c(5.5, 6.5), c(8, 10)) # water region; add more ranges if needed
+exclude_ranges <- list(c(4.5, 5.1)) # list(c(-1, 1.5), c(2, 3), c(4.5, 5.1), c(5.5, 6.5), c(8, 10)) # water region; add more ranges if needed
+
+
+# Example include range (use only if mode == "include")
+include_range <- c(-0.2, 0.2) # narrow ROI example around 0 ppm (modify as needed)
+
+
+keep_idx <- rep(TRUE, length(ppm))
+if (mode == "exclude" && length(exclude_ranges) > 0) {
+for (rg in exclude_ranges) {
+if (length(rg) == 2 && !any(is.na(rg))) {
+lo <- min(rg); hi <- max(rg)
+keep_idx <- keep_idx & !(ppm >= lo & ppm <= hi)
+}
+}
+} else if (mode == "include" && length(include_range) == 2) {
+lo <- min(include_range); hi <- max(include_range)
+keep_idx <- (ppm >= lo & ppm <= hi)
+}
+
+
+# Apply mask and sort by decreasing ppm (conventional NMR axis)
+ppm_kept <- ppm[keep_idx]
+cols_kept <- which(keep_idx)
+ord <- order(ppm_kept, decreasing = TRUE)
+
+
+spectra_mat_roi <- spectra_mat[, cols_kept, drop = FALSE]
+spectra_mat_roi <- spectra_mat_roi[, ord, drop = FALSE]
+ppm_kept <- ppm_kept[ord]
+
+
+# Quick overlay plot of all spectra in ROI
+# (If many spectra, use transparency)
+col_line <- grDevices::adjustcolor("black", alpha.f = 0.3)
+matplot(ppm_kept, t(spectra_mat_roi), type = "l", lty = 1, col = col_line,
+xlab = "ppm", ylab = "Intensity", main = "All spectra (ROI filtered)")
+
+
+# Optional: visualize excluded ranges
+if (mode == "exclude" && length(exclude_ranges) > 0) {
+for (rg in exclude_ranges) {
+lo <- min(rg); hi <- max(rg)
+abline(v = c(lo, hi), col = "red", lty = 3)
+}
+}
+
+
+# From here on, use the ROI-filtered spectra
+spectra_mat <- spectra_mat_roi
+```
+---
+
+# 3. Train/Test Split (Stratified on Class)
+
+
+
+
+```{r split}
+set.seed(123)
+if (!("covid_bin" %in% colnames(Dat))) stop("covid_bin column missing after relabel.")
+
+idx_cls <- createDataPartition(Dat$covid_bin, p = 0.7, list = FALSE)
+
+train_spectra <- spectra_mat[idx_cls, , drop = FALSE]
+train_meta <- Dat[idx_cls, , drop = FALSE]
+
+test_spectra <- spectra_mat[-idx_cls, , drop = FALSE]
+test_meta <- Dat[-idx_cls, , drop = FALSE]
+
+if ("BMI" %in% colnames(train_meta)) { summary(train_meta$BMI); summary(test_meta$BMI) }
+```
+---
+
+
+# 4. PCA on Training Spectra, Apply to Test
+
+
+```{r pca}
+# PCA with centering & scaling
+#pca_fit <- prcomp(train_spectra, center = TRUE, scale. = TRUE)
+#pca_fit <- prcomp(train_spectra, center = FALSE, scale. = FALSE)
+
+
+
+# Variance explained to help choose PCs
+var_explained <- pca_fit$sdev^2 / sum(pca_fit$sdev^2)
+cumvar <- cumsum(var_explained)
+head(data.frame(PC = seq_along(var_explained), Var = var_explained, CumVar = cumvar), 15)
+
+
+# Choose number of PCs (e.g., 5). Adjust as needed (3–10)
+nPC <- 38
+
+
+# Project to PC space
+train_PC <- pca_fit$x[, 1:nPC, drop = FALSE]
+test_PC <- predict(pca_fit, newdata = test_spectra)[, 1:nPC, drop = FALSE]
+
+
+# For convenience, make data frames with targets
+train_reg <- data.frame(BMI = train_meta$BMI, train_PC)
+test_reg <- data.frame(BMI = test_meta$BMI, test_PC)
+
+
+train_cls <- data.frame(covid_bin = train_meta$covid_bin, train_PC)
+test_cls <- data.frame(covid_bin = test_meta$covid_bin, test_PC)
+
+```
+
+
+*Tip:* If the first ~5–10 PCs already capture a large fraction of variance (and show bio-separation), that’s usually enough for simple models.
+
+---
+
+```{r plot_pca}
+## PC1 vs PC2 colored by BMI (training set) — base R, no tidyverse
+
+# If you already computed PCA -> ensure train_PC has at least 2 PCs.
+# Otherwise compute PCA on train_spectra:
+if (!exists("train_PC")) {
+  stopifnot(exists("train_spectra"))
+  pca_fit  <- prcomp(train_spectra, center = FALSE, scale. = FALSE)
+  train_PC <- pca_fit$x  # rows = samples, cols = PCs
+}
+
+# Grab BMI (numeric) for training samples
+stopifnot(exists("train_meta"))
+bmi <- as.numeric(train_meta$BMI)
+
+# Drop NAs if any
+ok <- is.finite(bmi) & is.finite(train_PC[,1]) & is.finite(train_PC[,2])
+PC1 <- train_PC[ok, 1]
+PC2 <- train_PC[ok, 2]
+bmi_ok <- bmi[ok]
+
+# Map BMI to a color gradient
+pal <- colorRampPalette(c("navy", "cyan", "yellow", "red"))
+nbins <- 100
+cols  <- pal(nbins)
+zcut  <- as.integer(cut(bmi_ok, breaks = nbins, include.lowest = TRUE))
+
+# Plot
+plot(PC1, PC2,
+     col = cols[zcut], pch = 19,
+     xlab = "PC1", ylab = "PC2",
+     main = "Training: PC1 vs PC2 colored by BMI")
+
+# Simple continuous color bar (right side)
+usr <- par("usr")
+x0 <- usr[2] + 0.04 * diff(usr[1:2])
+x1 <- x0 + 0.03 * diff(usr[1:2])
+y0 <- usr[3]; y1 <- usr[4]
+rect(xleft = x0, ybottom = seq(y0, y1, length.out = nbins)[-nbins],
+     xright = x1, ytop = seq(y0, y1, length.out = nbins)[-1],
+     col = cols, border = NA)
+# Add ticks/labels
+axis_y_vals <- pretty(range(bmi_ok), n = 5)
+axis_y_pos  <- y0 + (axis_y_vals - min(bmi_ok)) / diff(range(bmi_ok)) * (y1 - y0)
+segments(x1, axis_y_pos, x1 + 0.01 * diff(usr[1:2]), axis_y_pos)
+text(x1 + 0.015 * diff(usr[1:2]), axis_y_pos, labels = axis_y_vals, adj = 0)
+text(x0, y1 + 0.04 * diff(usr[3:4]), labels = "BMI", adj = c(0, 0))
+
+# Optional: add a legend for number of points
+legend("topright", legend = sprintf("n = %d", length(bmi_ok)), bty = "n")
+```
+```{r}
+# Plot the explained variance for the previous PCA
+plot(cumvar, type = 'b', pch = 19, xlab = "Number of PCs", ylab = "Cumulative Variance Explained",
+     main = "PCA Variance Explained")
+abline(v = nPC, col = "red", lty = 2) 
+text(nPC + 1, 0.5, labels = sprintf("nPC = %d", nPC), col = "red", adj = c(0, 0))   
+
+```
+
+---
+
+
+# 5. REGRESSION — Predict BMI from PCs
+
+
+```{r regression-fit}
+# Multiple Linear Regression (BMI ~ PCs)
+reg_formula <- as.formula(paste("BMI ~", paste(colnames(train_PC), collapse = "+")))
+reg_lm <- lm(reg_formula, data = train_reg)
+summary(reg_lm)
+
+```
+
+```{r regression-eval}
+# Predict on test
+pred_bmi <- predict(reg_lm, newdata = train_reg)
+
+
+gt <- train_reg$BMI
+mse <- mean((gt - pred_bmi)^2)
+ss_res <- sum((gt - pred_bmi)^2)
+ss_tot <- sum((gt - mean(gt, na.rm = TRUE))^2)
+r2 <- 1 - ss_res/ss_tot
+
+
+cat(sprintf("Train MSE: %.3f", mse))
+cat(sprintf("Train R^2: %.3f", r2))
+
+
+# Plot predicted vs. actual
+plot(gt, pred_bmi,
+xlab = "Actual BMI", ylab = "Predicted BMI",
+main = sprintf("BMI Regression: Train Set (nPC=%d)
+R^2=%.3f, MSE=%.3f", nPC, r2, mse))
+abline(0, 1, lty = 2)
+
+```
+
+```{r regression-eval}
+# Predict on test
+pred_bmi <- predict(reg_lm, newdata = test_reg)
+
+
+gt <- test_reg$BMI
+mse <- mean((gt - pred_bmi)^2)
+ss_res <- sum((gt - pred_bmi)^2)
+ss_tot <- sum((gt - mean(gt, na.rm = TRUE))^2)
+r2 <- 1 - ss_res/ss_tot
+
+
+cat(sprintf("Test MSE: %.3f
+", mse))
+cat(sprintf("Test R^2: %.3f
+", r2))
+
+
+# Plot predicted vs. actual
+plot(gt, pred_bmi,
+xlab = "Actual BMI", ylab = "Predicted BMI",
+main = sprintf("BMI Regression: Test Set (nPC=%d)
+R^2=%.3f, MSE=%.3f", nPC, r2, mse))
+abline(0, 1, lty = 2)
+
+```
+
+
+
+> **Interpretation:** Higher R² and lower MSE indicate better predictive performance. Check `summary(reg_lm)` to see which PCs contribute most.
+
+
