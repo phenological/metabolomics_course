@@ -1,0 +1,225 @@
+---
+title: "Visualization of multivariate NMR-based models and feature identification 1: What is this dataset?"
+author: "A Bernal"
+date: "2025-09-28"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+NMR spectrocopy provides a fingerprint of the metabolome. Multivariate statistics identifes variations in the fingerprint associated with disease, diet, genetics... you name it. Combined with expertise in NMR spectra interpretation and ever-growing public databases, it is possible to identifty the corresponding metabolites and start ellucidating the underlying biochemical mechanisms.
+
+# Utils
+
+We''l be working with in-house pacakges from *github/phenological
+
+* *fusion* to manage in-house data structures (data elements)
+* *nmr.spectra.processing* for pre-processing of NMR data
+* *mva.plots* for multivariate analysis and visualization
+
+and some CRAN packages
+
+```{r}
+#data.table is a powerful package for... well, managing data tables. Way better than any of the alternatives, worth learning if you are using R.
+library(data.table)
+
+#ropls is a library to make multivariate models. mva.plots draws from that
+#library. Loading ropls allow us to access its own vizualisations, some of which
+#are pretty useful
+library(ropls)
+
+library(fusion)
+library(nmr.spectra.processing)
+library(mva.plots)
+
+#mva.plots is based on ggplot2. Loading the whole library allows us to style
+#our plots
+library(ggplot2)
+#Global style I personally prefer
+theme_set(theme_bw())
+```
+
+# Data
+
+What are these data? We are dealing with NMR spectra, of course; but of what kind of samples? What kind of treatments were these samples or their sources subjected to? Any idea what this project might have been about? Play around with this chunk and try to figure that out.
+
+```{r}
+#This project's data consists of:
+#The nmr spectra
+#nmr parameters + other data
+#It's all packed into a dataElement (daE) object, which we read from a file 
+#stored in the metabolomics_course repository
+
+load("bioreactor_C1_CUL_NMR-URINE_BRXr01_BRXp003_lowres.daE")
+#Look at the "environment" tab to see that we have just loaded a dataElement
+#called "noesy"
+
+#Currently I find it more comfortable to split the daE into pieces:
+## 1) The chemical shift scale of the nmr spectra (a.k.a. ppm).
+##    In the daE it is stored as "words" but it is more natural to regard it 
+##    as a number
+ppm <- as.numeric(noesy@varName)
+## 2) The nmr spectra matrix, giving the intensities for each ppm
+Y <- noesy@.Data
+## 3) Other data
+meta <- noesy@obsDescr[[1]]
+##   In the daE these data are stored as a data.frame. Let's change that into
+##   a data.table
+setDT(meta)
+
+#Column names from the meta table
+names(meta)
+#Inspecting and counting values from columns that look interesting helps us
+#understand the dataset
+meta[,.N,.(treatmentGroup)]
+#We may easily get these counts not by a single column, but by multiple columns
+meta[,.N,.(sampleTimePoint,treatmentGroup)]
+#Any other columns you want to inspect? Go ahead and try it!
+
+```
+
+The following chunk contains code to visualize the spectrum.
+
+* What is the singlet at 0 ppm? (-0.1 to 0.1)
+* What is the odd-looking signal around 4.8 ppm? (4.7 to 4.9)
+* What is the singlet at 12 ppm?
+
+```{r}
+smatplot(ppm,Y)
+#You can select a "region of interest" (roi) to take a closer look
+smatplot(ppm,Y,roi=c(-0.1,0.1))
+
+#smatplot's capabilities are limited; it is a minimalist plotter built for speed.
+#But it still can color your spectra according to a variable (though it's no so
+#good at telling what each color stands for!
+smatplot(ppm,Y,roi=c(0.7,1.1),col=factor(meta$treatmentGroup))
+
+#You may also plot only some selected samples
+smatplot(ppm,Y[meta$sampleType== "Faecal",],roi=c(0.7,1.6))
+```
+
+# Pre-processing
+
+The following chunk contains code to:
+
+* trim the spectra
+* calibrate the spectra to the TSP peak
+
+1. Are some of these steps unneeded? Comment them out if that is the case.
+
+2. Is everything we need to do included? If not, add in whatever is missing.
+
+3. What do you think about the order in which this operations are being performed?
+
+4. Any other concerns?
+
+```{r}
+fi <- crop(ppm,-0.1,0.1) #logical filter selecting the tsp region
+fi <- !fi #negating the tsp-selecting filter produces a filter that _removes_ tsp
+ppm2 <- ppm[fi] #we apply the filter to the chem. shift scale and..
+Y2 <- Y[,fi] #... we applyt the filter to the spectra matrix
+#Same for water
+fi <- crop(ppm2,4.6,5)
+fi <- !fi
+ppm2 <- ppm2[fi]
+Y2 <- Y2[,fi]
+
+Y2 <- calibrateSpectra(ppm2,Y2,ref="tsp")
+
+par(mfcol=c(2,1)) # Next two plots are displayed together,
+                  # arranged in 2 rows and 1 column
+smatplot(ppm2,Y2)
+smatplot(ppm,Y)
+
+Y <- Y2
+ppm <- ppm2
+rm(Y2,ppm2)
+
+par(mfcol=c(1,1))
+```
+
+# PCA
+
+Whether for modelling or for quality control, PCA is always a good starting point.
+
+Try different colorings of the scores plot. What clusters can you distinguish?
+
+```{r}
+#mva.plots needs the ppm as column names in the spectra matrix
+#to function properly
+colnames(Y) <- ppm
+
+pcs <- PCA(Y)
+
+plotScores(pcs,optns=list(ellipse="hotellings",color=factor(meta$treatmentGroup)))
+```
+
+A loadings plot of the principal components highlihgts the key variables explaining most of the variability in the dataset
+
+```{r}
+PlotLoadSpec(pcs)
+
+PlotLoadSpec(pcs,roi=c(0.7,2.5))
+
+#By default PlotLoadSpec plots PC1. We can ask to plot any other PC
+PlotLoadSpec(pcs,PC=2,roi=c(2.9,4))
+```
+
+Consult https://pubs.acs.org/doi/10.1021/acs.analchem.5b00977 Table 1 to help you ellucidate the key metabolites governing variation in this dataset. Can you see figure out what is going on, biologically? Have you figured out what is the story behind this dataset?
+
+#[O]PLS 
+
+PLS is a multivariate regression method designed for situations where we have more variables than observations -the typical case in NMR-based metabolomics.
+
+Roughly speaking, PLS works by finding linear combinations of the predictive (independent) variables with maximum *covariance* to the given response variable.
+
+PLS can be used for classification. In this case it is sometimes called PLS-DA (Discriminant Analysis). Some authors reserve the DA tag for the binary case (two classes).
+
+OPLS is a variation on PLS that operates "backwards": it removes variation that is *unrelated* (orthogonal) to the response variable, removes it (deflates), and regresses the remainder to the response variable. The advantage of this approach is that it produces an univariate predictor.
+
+Give [O]PLS a hypothesis (x determines y) and it will do its best to corroborate it -no matter how spurious it needs to get to please you. Therefore, model validation is crucial. Our implementation is based on ropls, which by default runs a 7-fold cross-validation + additional tests as required.
+
+As an example, we will OPLS regress the time variable to the NMR, to try to see what is happenning to these samples as time progresses. But before proceeding, filter the rows and columns of the data matrix that make sense for this excercise:
+
+```{r}
+X <- #filtered NMR data matrix
+y <- #response variable i.e. time. Don't forget to filter!
+```
+
+Now we OPLS:
+
+```{r}
+#permI=20 commands a repetition of the whole opls fitting procedure with 100
+#random permutations of the response variable. If these random models are ase good as the original, it is likely that we are facing overfitting.
+mdl <- oplsda(X,y,type="OPLS",optns=list(permI=100))
+plot(mdl,typeVc=c("overview","permutation","predict-train"))
+
+PlotLoadSpec(mdl)
+```
+
+The model looks excellent but there is enough reason to pause: we only have 4 different time points. What if we approach this as a classification problem instead?
+
+ropls cannot do OPLS classification with >2 classes. But it can do PLS:
+
+```{r}
+#Casting as factor enforces DA modeling over continuous regression
+mdl <- oplsda(X,factor(y),type="PLS",optns=list(permI=100))
+plot(mdl,typeVc=c("overview","permutation","outlier","x-score"))
+
+PlotLoadSpec(mdl)
+PlotLoadSpec(mdl,PC=2)
+```
+
+What are your thoughts on this model? Does it agree or disagree with the OPLS regression model we built initially?
+
+Use OPLS-DA to characterise the differences between "dark" and "light" samples. Are they different? If they are, what is different about them? 
+
+```{r}
+#Do it yourself
+```
+
+What is your final conclusion?
